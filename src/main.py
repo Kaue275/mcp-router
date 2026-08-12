@@ -3,25 +3,54 @@ import shutil
 from mcp import ClientSession
 from mcp.client.stdio import StdioServerParameters, stdio_client
 import os
+import sys
+from pathlib import Path
 
 mcp = FastMCP("MCP Demo")
 
-uvx_exe = shutil.which("uvx") or shutil.which("uvx.exe") or shutil.which("uv")
+
+def resolve_uvx() -> str:
+    """Localiza o executável do uvx, incluindo o venv que roda este script.
+
+    O PATH do processo que inicia o servidor (ex.: Claude Code) pode não conter
+    os Scripts/bin do venv, então procuramos primeiro ao lado do interpretador.
+    """
+    scripts_dir = Path(sys.executable).parent
+    for candidate in ("uvx.exe", "uvx"):
+        local = scripts_dir / candidate
+        if local.is_file():
+            return str(local)
+
+    found = shutil.which("uvx")
+    if found:
+        return found
+
+    raise RuntimeError(
+        "'uvx' não encontrado. Instale com: pip install uv (ou instale o uv globalmente)."
+    )
+
+
+uvx_exe = resolve_uvx()
 
 sub_mcp = {
+    # O mcp-server-git declara "mcp>=1.0.0" sem teto, mas quebra com o SDK 1.29+
+    # ('Server' object has no attribute 'list_tools'). Fixamos o SDK do subprocesso.
     "git": StdioServerParameters(
-        command=uvx_exe or "uvx",
-        args=["mcp-server-git"],
+        command=uvx_exe,
+        args=["--with", "mcp<1.29", "mcp-server-git"],
         env=os.environ.copy(),
     )
 }
 
 # Armazena em memória as ferramentas descobertas nos sub-MCPs
 TOOL_CATALOG = {}
+# Erros de inicialização por sub-MCP, mantidos fora do catálogo de ferramentas
+DISCOVERY_ERRORS = {}
 
 
 async def discover_sub_mcp_tools():
-    """Conecta nos sub-MCPs no startup e indexa suas ferramentas silenciosamente."""
+    """Conecta nos sub-MCPs e indexa suas ferramentas silenciosamente."""
+    DISCOVERY_ERRORS.clear()
     for mcp_name, params in sub_mcp.items():
         try:
             async with stdio_client(params) as (read, write):
@@ -37,12 +66,7 @@ async def discover_sub_mcp_tools():
                             "inputSchema": tool.inputSchema,
                         }
         except Exception as exc:
-            TOOL_CATALOG[mcp_name] = {
-                "mcp_name": mcp_name,
-                "tool_name": None,
-                "description": f"Falha ao inicializar o sub-MCP: {exc}",
-                "inputSchema": {},
-            }
+            DISCOVERY_ERRORS[mcp_name] = f"{type(exc).__name__}: {exc}"
 
 
 # 2. Ferramentas que o FastMCP expõe para o Claude Code
@@ -63,9 +87,15 @@ async def search_tools(query: str) -> str:
             matched.append(f"- {full_name}: {description}")
     
     if not matched:
-        return f"Nenhuma ferramenta encontrada para a busca: '{query}'."
-        
-    return "Ferramentas encontradas:\n" + "\n".join(matched)
+        resposta = f"Nenhuma ferramenta encontrada para a busca: '{query}'."
+    else:
+        resposta = "Ferramentas encontradas:\n" + "\n".join(matched)
+
+    if DISCOVERY_ERRORS:
+        falhas = "\n".join(f"- {nome}: {erro}" for nome, erro in DISCOVERY_ERRORS.items())
+        resposta += f"\n\nSub-MCPs que falharam ao inicializar:\n{falhas}"
+
+    return resposta
 
 
 @mcp.tool()
